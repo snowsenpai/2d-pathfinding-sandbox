@@ -3,10 +3,10 @@
 class Vec2
 {
 public:
-	float x = 0;
-	float y = 0;
-	
-	Vec2();
+	float x = 0.f;
+	float y = 0.f;
+
+	Vec2() = default;
 	Vec2(float xIn, float yIn);
 
 	bool operator == (const Vec2& rhs) const;
@@ -22,15 +22,15 @@ public:
 	void operator *= (const float val);
 	void operator /= (const float val);
 
-	// calculates the distance between destination and origin (this*)
-	float distance(const Vec2& destination) const;
+	// angle of this vector measured from the +x axis, via atan2(y, x)
+	// range: (-Pi, Pi]. NOTE: screen y points DOWN, so positive angles rotate clockwise on screen
+	float angleRadians() const;
+	float angleDegrees() const;
 
-	// calculates the angle of this* using its x,y components
-	// this* must be a difference vector(distance) between two position vector (Vec2 destination - Vec2 origin)
-	// returns angle in degrees
-	float angle() const;
-	
-	// calculates the velocity vector
-	// angle must be in degrees
-	static Vec2 velocity(float speed, float angle);
+	// vector of the given length pointing at the given angle
+	static Vec2 fromAngleRadians(float length, float radians);
+	static Vec2 fromAngleDegrees(float length, float degrees);
+
+	// calculates the distance between destination and origin(this*)
+	float distance(const Vec2& destination) const;
 };

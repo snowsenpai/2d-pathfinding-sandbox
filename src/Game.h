@@ -3,7 +3,7 @@
 #include "EntityManager.h"
 #include "Entity.h"
 
-#include <SFML/Graphics.hpp>
+#include <SFML/Graphics/RenderWindow.hpp>
 
 #include <memory>
 #include <type_traits>

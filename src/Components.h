@@ -2,7 +2,8 @@
 
 #include "Vec2.h"
 
-#include <SFML/Graphics.hpp>
+#include <SFML/Graphics/CircleShape.hpp>
+#include <SFML/Graphics/Color.hpp>
 
 class CTransform
 {

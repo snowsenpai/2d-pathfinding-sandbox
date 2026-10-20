@@ -1,7 +1,6 @@
 #include "Vec2.h"
+#include "MathUtils.h"
 #include <cmath>
-
-Vec2::Vec2() {}
 
 Vec2::Vec2(float xIn, float yIn) : x(xIn), y(yIn) {}
 
@@ -12,7 +11,7 @@ bool Vec2::operator == (const Vec2& rhs) const
 
 bool Vec2::operator != (const Vec2& rhs) const
 {
-	return (x != rhs.x && y != rhs.y);
+	return !(*this == rhs);
 }
 
 Vec2 Vec2::operator + (const Vec2& rhs) const
@@ -69,18 +68,15 @@ float Vec2::distance(const Vec2& destination) const
 	return distance;
 }
 
-constexpr double pi = 3.14159265358979323846;
+float Vec2::angleRadians() const { return std::atan2(y, x); }
+float Vec2::angleDegrees() const { return math::toDegrees(angleRadians()); }
 
-float Vec2::angle() const
+Vec2 Vec2::fromAngleRadians(float length, float radians)
 {
-	float rad = std::atan2(y, x);
-	float deg = static_cast<float>(rad * 180 / pi);
-
-	return deg;
+	return Vec2(length * std::cos(radians), length * std::sin(radians));
 }
 
-Vec2 Vec2::velocity(float speed, float angle)
+Vec2 Vec2::fromAngleDegrees(float length, float degrees)
 {
-	double rad = angle * pi / 180;
-	return Vec2(speed * static_cast<float>(std::cos(rad)), speed * static_cast<float>(std::sin(rad)));
+	return fromAngleRadians(length, math::toRadians(degrees));
 }
