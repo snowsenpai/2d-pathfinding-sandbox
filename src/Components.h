@@ -5,6 +5,9 @@
 #include <SFML/Graphics/CircleShape.hpp>
 #include <SFML/Graphics/Color.hpp>
 
+#include <cstddef>
+#include <vector>
+
 class CTransform
 {
 public:
@@ -32,7 +35,7 @@ class CBoundingCircle
 {
 public:
 	float radius = 0.0f;
-	
+
 	CBoundingCircle(float r)
 		: radius(r) {}
 };
@@ -50,6 +53,25 @@ public:
 		circle.setOutlineThickness(thickness);
 		circle.setOrigin({ radius, radius });
 	}
+};
+
+// Where a path follower is in its life.
+enum class FollowState { Idle, Following, Arrived };
+
+// Marks an entity as driven by a route instead of the keyboard.
+// CONTROL OWNERSHIP: an entity is moved by exactly ONE of CInput (sMovement) or CPathFollower
+// (sPathFollow). Never both, or two systems would fight over velocity.
+// Waypoints are world-space pixels (not grid cells) so this component knows nothing about Grid.
+class CPathFollower
+{
+public:
+	std::vector<Vec2> waypoints;
+	std::size_t next = 0;                 // index of the waypoint currently being approached
+	float speed = 160.0f;                 // px/s
+	FollowState state = FollowState::Idle;
+
+	CPathFollower() = default;
+	explicit CPathFollower(float speedPxPerSec) : speed(speedPxPerSec) {}
 };
 
 class CInput

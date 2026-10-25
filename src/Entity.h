@@ -14,7 +14,8 @@ using ComponentTuple = std::tuple<
 	std::optional<CBoundingBox>,
 	std::optional<CBoundingCircle>,
 	std::optional<CShape>,
-	std::optional<CInput>
+	std::optional<CInput>,
+	std::optional<CPathFollower>
 >;
 
 class Entity
