@@ -1,4 +1,5 @@
 #include "Grid.h"
+#include "Vec2.h"
 
 #include <algorithm>
 #include <cmath>
