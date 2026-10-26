@@ -20,7 +20,7 @@
 #include <type_traits>
 #include <vector>
 
-enum class Tool { Wall, Erase, Start, Goal };
+enum class Tool { Wall, Erase, Start, Goal, Mud };
 
 // What the UI asks the search system to do next frame. The UI only REQUESTS; sSearch executes.
 enum class SearchCommand { None, Start, Step, Reset };
@@ -59,6 +59,9 @@ class Game
 	float m_searchAccum = 0.f;                             // fractional expansions owed (carries between frames)
 	bool  m_mapChanged = false;                            // set by any edit; invalidates a running/finished search
 	bool  m_showSearchOverlay = true;
+	bool  m_showHeatmap = false;                           // colour visited cells by their cost
+	SearchOptions m_searchOptions;                         // algorithm, 4/8-way, corner rule (edited in ImGui)
+	bool  m_searchOptionsChanged = false;                  // options changed: reset the search, but the map itself is fine
 
 	// ---------- agent (path-following simulation) ----------
 	std::shared_ptr<Entity> m_agent;                       // null when no agent exists

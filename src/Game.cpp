@@ -3,6 +3,7 @@
 #include "Grid.h"
 #include "Movement.h"
 #include "PathFollow.h"
+#include "PathSearch.h"
 #include "Vec2.h"
 
 #include <imgui.h>
@@ -10,8 +11,10 @@
 
 #include <SFML/Graphics/CircleShape.hpp>
 #include <SFML/Graphics/Color.hpp>
+#include <SFML/Graphics/Rect.hpp>
 #include <SFML/Graphics/RectangleShape.hpp>
 #include <SFML/Graphics/Vertex.hpp>
+#include <SFML/Graphics/View.hpp>
 #include <SFML/System/Vector2.hpp>
 #include <SFML/Window/Event.hpp>
 #include <SFML/Window/Keyboard.hpp>
@@ -20,9 +23,11 @@
 #include <SFML/Window/WindowEnums.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <utility>
+#include <vector>
 
 namespace
 {
@@ -39,6 +44,16 @@ namespace
 	const sf::Color VisitedColor(70, 90, 160, 170);   // expanded cells
 	const sf::Color FrontierColor(230, 190, 60, 210); // queued, waiting to be expanded
 	const sf::Color PathColor(0, 230, 230);           // final path through cell centres
+	const sf::Color MudColor(110, 80, 50);            // Tile::Mud
+
+	// t in [0,1]: 0 = cheap to reach (dark blue) ... 1 = expensive (hot orange).
+	// Alpha keeps the terrain colour visible underneath.
+	sf::Color heatColor(float t)
+	{
+		t = std::clamp(t, 0.f, 1.f);
+		const auto mix = [t](float a, float b) { return static_cast<std::uint8_t>(a + (b - a) * t); };
+		return sf::Color(mix(40.f, 235.f), mix(80.f, 70.f), mix(200.f, 90.f), 190);
+	}
 }
 
 // ======================================================================================
@@ -105,6 +120,7 @@ void Game::update()
 	sAgentControl();                                    // agent: react to edits / UI commands
 	sSearch(frameTime);                                 // pathfinding: once per frame, own accumulator
 	m_mapChanged = false;                               // every per-frame system above has now seen the edit
+	m_searchOptionsChanged = false;
 
 	// ---- how many fixed ticks to run this frame? ----
 	int ticks = 0;
@@ -321,16 +337,24 @@ void Game::sEditTools()
 			m_mapChanged = true;
 		}
 		break;
+	case Tool::Mud:
+		// Painting mud over a wall replaces it; over start/goal is fine (mud is walkable).
+		if (m_grid.get(cell) != Tile::Mud)
+		{
+			m_grid.set(cell, Tile::Mud);
+			m_mapChanged = true;
+		}
+		break;
 	case Tool::Start:
-		// Rule: start must be on an open cell and must differ from goal.
-		if (m_grid.get(cell) == Tile::Open && !onGoal && !onStart)
+		// Rule: start must be on a walkable tile (open or mud) and must differ from goal.
+		if (m_grid.isWalkable(cell) && !onGoal && !onStart)
 		{
 			m_start = cell;
 			m_mapChanged = true;
 		}
 		break;
 	case Tool::Goal:
-		if (m_grid.get(cell) == Tile::Open && !onStart && !onGoal)
+		if (m_grid.isWalkable(cell) && !onStart && !onGoal)
 		{
 			m_goal = cell;
 			m_mapChanged = true;
@@ -380,12 +404,19 @@ void Game::sImGui()
 		ImGui::RadioButton("Wall", &tool, static_cast<int>(Tool::Wall));   ImGui::SameLine();
 		ImGui::RadioButton("Erase", &tool, static_cast<int>(Tool::Erase)); ImGui::SameLine();
 		ImGui::RadioButton("Start", &tool, static_cast<int>(Tool::Start)); ImGui::SameLine();
-		ImGui::RadioButton("Goal", &tool, static_cast<int>(Tool::Goal));
+		ImGui::RadioButton("Goal", &tool, static_cast<int>(Tool::Goal));       ImGui::SameLine();
+		ImGui::RadioButton("Mud", &tool, static_cast<int>(Tool::Mud));
 		m_tool = static_cast<Tool>(tool);
 
 		ImGui::TextUnformatted("Left drag: use tool.  Right drag: erase.");
 
-		if (ImGui::Button("Clear walls"))
+		// Terrain cost is map data: changing it makes any existing result stale.
+		if (ImGui::SliderFloat("Mud cost", &m_grid.costs.mud, 1.0f, 10.0f, "%.2f"))
+		{
+			m_mapChanged = true;
+		}
+
+		if (ImGui::Button("Clear terrain"))
 		{
 			m_grid.clearWalls();
 			m_mapChanged = true;
@@ -404,7 +435,7 @@ void Game::sImGui()
 		else         ImGui::TextUnformatted("Goal: not set");
 	}
 
-	if (ImGui::CollapsingHeader("Search (BFS)", ImGuiTreeNodeFlags_DefaultOpen))
+	if (ImGui::CollapsingHeader("Search", ImGuiTreeNodeFlags_DefaultOpen))
 	{
 		// The UI only REQUESTS actions (m_searchCommand); sSearch performs them next.
 		const bool ready = m_start.has_value() && m_goal.has_value();
@@ -424,10 +455,30 @@ void Game::sImGui()
 
 		if (!ready) ImGui::TextUnformatted("Place a start and a goal first.");
 
+		// Search options. Changing any of them invalidates the current result.
+		int algo = static_cast<int>(m_searchOptions.algorithm);
+		const char* algoLabels[] = { "BFS (fewest steps)", "Dijkstra (cheapest cost)" };
+		if (ImGui::Combo("Algorithm", &algo, algoLabels, IM_ARRAYSIZE(algoLabels)))
+		{
+			m_searchOptions.algorithm = static_cast<Algorithm>(algo);
+			m_searchOptionsChanged = true;
+		}
+		if (ImGui::Checkbox("8-way movement", &m_searchOptions.diagonal))
+		{
+			m_searchOptionsChanged = true;
+		}
+		ImGui::BeginDisabled(!m_searchOptions.diagonal);
+		if (ImGui::Checkbox("Allow corner cutting", &m_searchOptions.allowCornerCutting))
+		{
+			m_searchOptionsChanged = true;
+		}
+		ImGui::EndDisabled();
+
 		ImGui::Checkbox("Auto-run", &m_autoRun);
 		ImGui::SliderFloat("Expansions/s", &m_expansionsPerSecond, 1.f, 2000.f, "%.0f",
 			ImGuiSliderFlags_Logarithmic);
 		ImGui::Checkbox("Show visited/frontier", &m_showSearchOverlay);
+		ImGui::Checkbox("Cost heatmap", &m_showHeatmap);
 
 		ImGui::Text("Status: %s", toString(status));
 		ImGui::Text("Expanded: %d", m_search.expanded());
@@ -436,6 +487,7 @@ void Game::sImGui()
 		{
 			const int cells = static_cast<int>(m_search.path().size());
 			ImGui::Text("Path: %d cells (%d moves)", cells, cells - 1);
+			ImGui::Text("Path cost: %.3f", static_cast<double>(m_search.pathCost()));
 		}
 	}
 
@@ -500,11 +552,12 @@ void Game::sRender()
 		for (int cx = 0; cx < m_grid.cols(); ++cx)
 		{
 			const Cell cell{ cx, cy };
-			if (m_grid.get(cell) != Tile::Wall) continue;
+			const Tile tile = m_grid.get(cell);
+			if (tile == Tile::Open) continue;
 
 			const Vec2 tl = m_grid.cellTopLeft(cell);
 			m_cellShape.setPosition({ tl.x, tl.y });
-			m_cellShape.setFillColor(WallColor);
+			m_cellShape.setFillColor(tile == Tile::Wall ? WallColor : MudColor);
 			m_window.draw(m_cellShape);
 		}
 	}
@@ -512,6 +565,23 @@ void Game::sRender()
 	// Search overlay: visited (blue) and frontier (yellow). Walls are never queued, so no overlap.
 	if (m_showSearchOverlay && m_search.status() != SearchStatus::Idle)
 	{
+		// Heatmap scale: the largest cost among expanded cells (one cheap pass over the grid).
+		float heatMax = 0.f;
+		if (m_showHeatmap)
+		{
+			for (int cy = 0; cy < m_grid.rows(); ++cy)
+			{
+				for (int cx = 0; cx < m_grid.cols(); ++cx)
+				{
+					const Cell cell{ cx, cy };
+					if (m_search.stateAt(cell) == NodeState::Visited)
+					{
+						heatMax = std::max(heatMax, m_search.costAt(cell));
+					}
+				}
+			}
+		}
+
 		for (int cy = 0; cy < m_grid.rows(); ++cy)
 		{
 			for (int cx = 0; cx < m_grid.cols(); ++cx)
@@ -522,7 +592,12 @@ void Game::sRender()
 
 				const Vec2 tl = m_grid.cellTopLeft(cell);
 				m_cellShape.setPosition({ tl.x, tl.y });
-				m_cellShape.setFillColor(s == NodeState::Visited ? VisitedColor : FrontierColor);
+				sf::Color color = FrontierColor;
+				if (s == NodeState::Visited)
+				{
+					color = (m_showHeatmap && heatMax > 0.f) ? heatColor(m_search.costAt(cell) / heatMax) : VisitedColor;
+				}
+				m_cellShape.setFillColor(color);
 				m_window.draw(m_cellShape);
 			}
 		}
@@ -694,7 +769,7 @@ void Game::applyDisplayMode()
 void Game::sSearch(float frameTime)
 {
 	// 1. Any map edit makes the search (and its overlays) wrong. Throw it away.
-	if (m_mapChanged)
+	if (m_mapChanged || m_searchOptionsChanged)
 	{
 		m_search.reset();
 		m_searchAccum = 0.f;
@@ -708,7 +783,7 @@ void Game::sSearch(float frameTime)
 	case SearchCommand::Start:
 		if (m_start && m_goal)
 		{
-			m_search.start(m_grid, *m_start, *m_goal);
+			m_search.start(m_grid, *m_start, *m_goal, m_searchOptions);
 			m_searchAccum = 0.f;
 		}
 		break;
@@ -799,7 +874,7 @@ void Game::runAgent()
 {
 	// m_mapChanged: an edit happened THIS frame but sSearch has not reset the search yet,
 	// so m_search may still say Found for a path that no longer exists. Refuse.
-	if (m_mapChanged || m_search.status() != SearchStatus::Found) return;
+	if (m_mapChanged || m_searchOptionsChanged || m_search.status() != SearchStatus::Found) return;
 
 	const std::vector<Cell>& path = m_search.path();
 	if (path.empty()) return;
@@ -826,7 +901,7 @@ void Game::runAgent()
 	follower.waypoints = std::move(waypoints);
 	follower.next = 1;                                         // index 0 is where we already stand
 	follower.state = (follower.next < follower.waypoints.size()) ? FollowState::Following
-		: FollowState::Arrived; // start == goal
+	                                                              : FollowState::Arrived; // start == goal
 
 	m_agent = agent;
 }

@@ -6,32 +6,47 @@
 #include <deque>
 #include <vector>
 
-// Resumable breadth-first search on a Grid.  No SFML, no ImGui, no entities.
+// Resumable grid search: BFS and Dijkstra.  No SFML, no ImGui, no entities.
 //
 // REUSING THIS IN A REAL GAME
-//   The search only asks the map three questions (all in PathSearch.cpp, marked "MAP QUERY"):
-//     grid.cols()/rows()   -> how big is the map
-//     grid.inBounds(cell)  -> is this cell inside the map
-//     grid.get(cell)       -> is it a Wall
-//   Swap `Grid` for your game's tile map by changing only those calls.
+//   The search only asks the map these questions (all in PathSearch.cpp, marked "MAP QUERY"):
+//     grid.cols()/rows()     -> how big is the map
+//     grid.inBounds(cell)    -> is this cell inside the map
+//     grid.isWalkable(cell)  -> can I stand here at all (not a wall)
+//     grid.moveCost(cell)    -> what does it cost to ENTER this cell (>= a small positive minimum)
+//   Swap `Grid` for your game's tile map by providing those four calls.
 //
 // USAGE
 //   PathSearch s;
-//   s.start(grid, startCell, goalCell);          // seeds the queue; status = Running
+//   SearchOptions opt;  opt.algorithm = Algorithm::Dijkstra;  opt.diagonal = true;
+//   s.start(grid, startCell, goalCell, opt);     // seeds the frontier; status = Running
 //   while (s.status() == SearchStatus::Running)  // or call s.step(grid) once per UI click
-//       s.step(grid);                            // ONE expansion per call
-//   if (s.status() == SearchStatus::Found) use(s.path());   // start -> goal, inclusive
+//       s.step(grid);                            // ONE real expansion per call
+//   if (s.status() == SearchStatus::Found) use(s.path(), s.pathCost());
 //   // one-liner for gameplay code: s.runToEnd(grid);
 //
-// The search stores its own per-cell arrays, so it does not touch the Grid.
-// If the Grid's walls change while a search is Running, the answer is stale: call reset().
+// COSTS
+//   Entering a cell costs  grid.moveCost(cell) * (diagonal step ? sqrt(2) : 1).
+//   BFS ignores costs while searching (it minimises STEPS) but still reports the true cost of the
+//   path it found, so BFS and Dijkstra results can be compared fairly.
+//
+// If the Grid (walls, terrain, costs) changes while a search is Running, the answer is stale: call reset().
 
 enum class SearchStatus { Idle, Running, Found, NoPath };
 
-// Unseen   : never queued
-// Frontier : discovered and queued, not yet expanded
-// Visited  : expanded (popped from the queue)
+// Unseen   : never discovered
+// Frontier : discovered, waiting to be expanded (its cost may still improve under Dijkstra)
+// Visited  : expanded; its cost is final
 enum class NodeState : std::uint8_t { Unseen, Frontier, Visited };
+
+enum class Algorithm { BFS, Dijkstra };
+
+struct SearchOptions
+{
+	Algorithm algorithm = Algorithm::BFS;   // defaults reproduce Checkpoint 2 behaviour exactly
+	bool diagonal = false;                  // false: 4-way, true: 8-way
+	bool allowCornerCutting = false;        // false: a diagonal needs BOTH orthogonal neighbours walkable
+};
 
 inline const char* toString(SearchStatus s)
 {
@@ -45,44 +60,90 @@ inline const char* toString(SearchStatus s)
 	return "?";
 }
 
+inline const char* toString(Algorithm a)
+{
+	switch (a)
+	{
+	case Algorithm::BFS:      return "BFS";
+	case Algorithm::Dijkstra: return "Dijkstra";
+	}
+	return "?";
+}
+
 class PathSearch
 {
-	SearchStatus m_status = SearchStatus::Idle;
+	// One entry of the Dijkstra frontier. Stale entries (cost worse than the best known) are
+	// skipped lazily when they reach the top, because a binary heap cannot decrease a key.
+	struct HeapEntry
+	{
+		float cost;
+		std::uint32_t seq;   // insertion order: makes ties deterministic
+		int idx;
+	};
+
+	// "Lower priority" for std::push_heap/pop_heap, which keep the LARGEST element on top.
+	// We want the CHEAPEST on top, so a is lower priority than b when a is more expensive.
+	struct HeapOrder
+	{
+		bool operator()(const HeapEntry& a, const HeapEntry& b) const
+		{
+			if (a.cost != b.cost) return a.cost > b.cost;
+			return a.seq > b.seq;
+		}
+	};
+
+	SearchStatus  m_status = SearchStatus::Idle;
+	SearchOptions m_options;
 	Cell m_start;
 	Cell m_goal;
 	int  m_cols = 0;
 	int  m_rows = 0;
 
 	std::vector<NodeState> m_state;   // cols*rows, row-major: index = y * cols + x
-	std::vector<int>       m_parent;  // index of the cell that discovered this one, -1 = none
-	std::deque<int>        m_queue;   // FIFO of cell indices (push_back / pop_front)
+	std::vector<int>       m_parent;  // index of the cell that discovered/improved this one, -1 = none
+	std::vector<float>     m_cost;    // best known cost from start; +infinity = unseen
+	std::deque<int>        m_queue;   // BFS frontier (FIFO)
+	std::vector<HeapEntry> m_heap;    // Dijkstra frontier (binary min-heap via std::push_heap/pop_heap)
+	std::uint32_t          m_seq = 0; // next HeapEntry::seq
 	std::vector<Cell>      m_path;    // start -> goal, filled when Found
+	float                  m_pathCost = 0.f;
 
-	int m_expanded = 0;               // cells popped so far
-	int m_maxFrontier = 0;            // largest queue size seen (memory-use indicator)
+	int m_expanded = 0;               // cells expanded so far (stale heap pops do NOT count)
+	int m_frontierCount = 0;          // cells currently in state Frontier
+	int m_maxFrontier = 0;            // largest frontier seen (memory-use indicator)
 
 	int  toIndex(Cell c) const { return c.y * m_cols + c.x; }
 	Cell toCell(int i) const { return Cell{ i % m_cols, i / m_cols }; }
-	void buildPath();
+
+	bool canStep(const Grid& grid, Cell from, const Cell& dir) const; // walkable target + corner rule
+	float stepCost(const Grid& grid, Cell to, const Cell& dir) const; // cost of making this step
+
+	void pushHeap(float cost, int idx);
+	void stepBfs(const Grid& grid);
+	void stepDijkstra(const Grid& grid);
+	void buildPath(const Grid& grid);
 
 public:
 	// Back to Idle; drops all overlays and results.
 	void reset();
 
-	// Seeds a new search. Returns false (and stays Idle) if start or goal is out of bounds or a wall.
+	// Seeds a new search. Returns false (and stays Idle) if start or goal is out of bounds or not walkable.
 	// start == goal is legal: the first step() pops it and reports Found with a one-cell path.
-	bool start(const Grid& grid, Cell start, Cell goal);
+	bool start(const Grid& grid, Cell start, Cell goal, SearchOptions options = {});
 
-	// Exactly ONE expansion. No-op unless Running.
+	// Exactly ONE real expansion. No-op unless Running.
 	void step(const Grid& grid);
 
 	// Convenience for gameplay code and tests: step until finished. Returns the final status.
 	SearchStatus runToEnd(const Grid& grid);
 
 	SearchStatus status() const { return m_status; }
+	const SearchOptions& options() const { return m_options; }
 	NodeState stateAt(Cell c) const;                  // Unseen for out-of-range cells or before start()
+	float costAt(Cell c) const;                       // best known cost; +infinity if unseen / out of range
 	const std::vector<Cell>& path() const { return m_path; }
+	float pathCost() const { return m_pathCost; }     // true cost of path(); 0 unless Found
 	int expanded() const { return m_expanded; }
-	int frontierSize() const { return static_cast<int>(m_queue.size()); }
+	int frontierSize() const { return m_frontierCount; }
 	int maxFrontier() const { return m_maxFrontier; }
 };

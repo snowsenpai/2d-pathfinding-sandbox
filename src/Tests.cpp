@@ -1,4 +1,4 @@
-// Checkpoint 1 + 2 + path-following tests. No SFML / ImGui needed: links Vec2.cpp, Grid.cpp, PathSearch.cpp.
+// Checkpoint 1 + 2 + 3 + path-following tests. No SFML / ImGui needed: links Vec2.cpp, Grid.cpp, PathSearch.cpp.
 // Build target: sandbox_tests.  Exit code 0 = all passed.
 
 #include "FixedStep.h"
@@ -8,9 +8,11 @@
 #include "PathSearch.h"
 #include "Vec2.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <vector>
 
@@ -96,6 +98,85 @@ static int ticksToArrive(const std::vector<Vec2>& wps, float speed, float dt, Ve
 	return -1;
 }
 
+// ---- Checkpoint 3 helpers ----
+
+static SearchOptions options(Algorithm a, bool diagonal, bool cornerCutting = false)
+{
+	SearchOptions o;
+	o.algorithm = a;
+	o.diagonal = diagonal;
+	o.allowCornerCutting = cornerCutting;
+	return o;
+}
+
+// Re-computes a path's cost from the grid ALONE (independent of PathSearch internals).
+static float recomputeCost(const Grid& g, const std::vector<Cell>& path)
+{
+	float total = 0.f;
+	for (std::size_t i = 1; i < path.size(); ++i)
+	{
+		const bool diag = path[i].x != path[i - 1].x && path[i].y != path[i - 1].y;
+		total += g.moveCost(path[i]) * (diag ? 1.41421356237f : 1.f);
+	}
+	return total;
+}
+
+// 8-way-aware validity: right endpoints, one king-move per step, walkable cells,
+// and (unless corner cutting is allowed) no diagonal between two wall corners.
+static bool pathIsValid8(const Grid& g, const std::vector<Cell>& path, Cell s, Cell goal, bool diagonal, bool cut)
+{
+	if (path.empty() || path.front() != s || path.back() != goal) return false;
+	for (std::size_t i = 0; i < path.size(); ++i)
+	{
+		if (!g.isWalkable(path[i])) return false;
+		if (i == 0) continue;
+		const int dx = path[i].x - path[i - 1].x;
+		const int dy = path[i].y - path[i - 1].y;
+		if (dx == 0 && dy == 0) return false;
+		if (std::abs(dx) > 1 || std::abs(dy) > 1) return false;
+		const bool diag = dx != 0 && dy != 0;
+		if (diag && !diagonal) return false;
+		if (diag && !cut)
+		{
+			if (!g.isWalkable(Cell{ path[i - 1].x + dx, path[i - 1].y })) return false;
+			if (!g.isWalkable(Cell{ path[i - 1].x, path[i - 1].y + dy })) return false;
+		}
+	}
+	return true;
+}
+
+static int countWalkable(const Grid& g)
+{
+	int n = 0;
+	for (int y = 0; y < g.rows(); ++y)
+		for (int x = 0; x < g.cols(); ++x)
+			if (g.isWalkable(Cell{ x, y })) ++n;
+	return n;
+}
+
+static int countMud(const Grid& g, const std::vector<Cell>& path)
+{
+	int n = 0;
+	for (const Cell& c : path) if (g.get(c) == Tile::Mud) ++n;
+	return n;
+}
+
+// 7x3 map, mud strip on (2,1),(3,1),(4,1): the cheap-looking straight line vs a detour.
+static Grid mudMap(float mudCost)
+{
+	Grid g(7, 3, 20.f);
+	for (int x = 2; x <= 4; ++x) g.set(Cell{ x, 1 }, Tile::Mud);
+	g.costs.mud = mudCost;
+	return g;
+}
+
+// Tiny deterministic PRNG so the property test is reproducible without <random> engine differences.
+static std::uint32_t nextRand(std::uint32_t& s)
+{
+	s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+	return s;
+}
+
 int main()
 {
 	// ---- Vec2 ----
@@ -126,8 +207,8 @@ int main()
 
 	// ---- one second of movement, different render rates (expected: ~240 px) ----
 	{
-		const Vec2 at60 = simulate(240.f, 60.f, 1.f);
-		const Vec2 at30 = simulate(240.f, 30.f, 1.f);
+		const Vec2 at60  = simulate(240.f, 60.f,  1.f);
+		const Vec2 at30  = simulate(240.f, 30.f,  1.f);
 		const Vec2 at144 = simulate(240.f, 144.f, 1.f);
 		std::printf("1s @240px/s -> 60fps: %.3f  30fps: %.3f  144fps: %.3f\n", at60.x, at30.x, at144.x);
 
@@ -403,6 +484,235 @@ int main()
 		}
 		CHECK(!clipped);
 		CHECK(next == wps.size());
+	}
+
+	// ================= Checkpoint 3: terrain, 8-way, Dijkstra =================
+
+	// ---- grid terrain basics ----
+	{
+		Grid g(5, 5, 20.f);
+		g.set(Cell{ 1, 1 }, Tile::Mud);
+		g.set(Cell{ 2, 2 }, Tile::Wall);
+		CHECK(g.isWalkable(Cell{ 1, 1 }) && g.isWalkable(Cell{ 0, 0 }));
+		CHECK(!g.isWalkable(Cell{ 2, 2 }) && !g.isWalkable(Cell{ -1, 0 }) && !g.isWalkable(Cell{ 5, 5 }));
+		CHECK(near(g.moveCost(Cell{ 0, 0 }), 1.f, 1e-6f));
+		CHECK(near(g.moveCost(Cell{ 1, 1 }), 3.f, 1e-6f));
+		CHECK(std::isinf(g.moveCost(Cell{ 2, 2 })) && std::isinf(g.moveCost(Cell{ -1, -1 })));
+		g.costs.mud = 0.f;                                   // a slider dragged to 0 must not break the search
+		CHECK(g.moveCost(Cell{ 1, 1 }) >= Grid::MinMoveCost);
+		g.costs.mud = -5.f;
+		CHECK(g.moveCost(Cell{ 1, 1 }) >= Grid::MinMoveCost);
+	}
+
+	// ---- open field: Dijkstra 4-way equals BFS ----
+	{
+		Grid g(40, 30, 20.f);
+		PathSearch ps;
+		CHECK(ps.start(g, Cell{ 0, 0 }, Cell{ 39, 29 }, options(Algorithm::Dijkstra, false)));
+		CHECK(ps.runToEnd(g) == SearchStatus::Found);
+		CHECK(ps.path().size() == 69);
+		CHECK(near(ps.pathCost(), 68.f, 1e-3f));
+		CHECK(pathIsValid8(g, ps.path(), Cell{ 0, 0 }, Cell{ 39, 29 }, false, false));
+	}
+
+	// ---- open field: Dijkstra 8-way ----
+	{
+		Grid g(40, 30, 20.f);
+		PathSearch ps;
+		CHECK(ps.start(g, Cell{ 0, 0 }, Cell{ 39, 29 }, options(Algorithm::Dijkstra, true)));
+		CHECK(ps.runToEnd(g) == SearchStatus::Found);
+		CHECK(ps.path().size() == 40);                       // 39 moves: 29 diagonal + 10 straight
+		CHECK(near(ps.pathCost(), 51.012193f, 1e-3f));       // 29*sqrt2 + 10
+		CHECK(ps.expanded() == 1200);                        // goal is the unique farthest cell
+		CHECK(near(ps.costAt(Cell{ 39, 29 }), ps.pathCost(), 1e-4f));
+		std::printf("Dijkstra 8-way open field: cost=%.3f cells=%zu expanded=%d\n",
+			static_cast<double>(ps.pathCost()), ps.path().size(), ps.expanded());
+	}
+
+	// ---- small diagonal cases ----
+	{
+		Grid g(5, 5, 20.f);
+		PathSearch ps;
+		ps.start(g, Cell{ 0, 0 }, Cell{ 4, 4 }, options(Algorithm::Dijkstra, true));
+		CHECK(ps.runToEnd(g) == SearchStatus::Found);
+		CHECK(ps.path().size() == 5 && near(ps.pathCost(), 5.656854f, 1e-3f));    // 4*sqrt2
+
+		ps.start(g, Cell{ 0, 0 }, Cell{ 4, 2 }, options(Algorithm::Dijkstra, true));
+		CHECK(ps.runToEnd(g) == SearchStatus::Found);
+		CHECK(ps.path().size() == 5 && near(ps.pathCost(), 4.828427f, 1e-3f));    // 2*sqrt2 + 2
+	}
+
+	// ---- terrain cost vs detour (4-way). Threshold: straight = 3 + 3m, detour = 8  =>  m = 5/3 ----
+	{
+		for (float m : { 5.f, 2.f })
+		{
+			Grid g = mudMap(m);
+			PathSearch ps;
+			ps.start(g, Cell{ 0, 1 }, Cell{ 6, 1 }, options(Algorithm::Dijkstra, false));
+			CHECK(ps.runToEnd(g) == SearchStatus::Found);
+			CHECK(near(ps.pathCost(), 8.f, 1e-3f));          // detour wins
+			CHECK(ps.path().size() == 9);
+			CHECK(countMud(g, ps.path()) == 0);
+		}
+
+		Grid cheap = mudMap(1.5f);
+		PathSearch ps;
+		ps.start(cheap, Cell{ 0, 1 }, Cell{ 6, 1 }, options(Algorithm::Dijkstra, false));
+		CHECK(ps.runToEnd(cheap) == SearchStatus::Found);
+		CHECK(near(ps.pathCost(), 7.5f, 1e-3f));             // straight through the mud: 1 + 3*1.5 + 1 + 1
+		CHECK(ps.path().size() == 7);
+		CHECK(countMud(cheap, ps.path()) == 3);
+
+		// BFS minimises steps, so it ignores mud entirely and pays for it
+		Grid dear = mudMap(5.f);
+		PathSearch bfs;
+		bfs.start(dear, Cell{ 0, 1 }, Cell{ 6, 1 }, options(Algorithm::BFS, false));
+		CHECK(bfs.runToEnd(dear) == SearchStatus::Found);
+		CHECK(bfs.path().size() == 7);                       // fewest steps...
+		CHECK(near(bfs.pathCost(), 18.f, 1e-3f));            // ...but 1 + 5*3 + 1 + 1 = 18 vs Dijkstra's 8
+	}
+
+	// ---- same map, 8-way: a diagonal detour is cheap for any mud cost >= 1.5 ----
+	{
+		for (float m : { 5.f, 2.f, 1.5f })
+		{
+			Grid g = mudMap(m);
+			PathSearch ps;
+			ps.start(g, Cell{ 0, 1 }, Cell{ 6, 1 }, options(Algorithm::Dijkstra, true));
+			CHECK(ps.runToEnd(g) == SearchStatus::Found);
+			CHECK(near(ps.pathCost(), 6.828427f, 1e-3f));    // 4 + 2*sqrt2
+			CHECK(ps.path().size() == 7);
+			CHECK(countMud(g, ps.path()) == 0);
+		}
+	}
+
+	// ---- corner cutting ----
+	{
+		// two walls box the start in diagonally
+		Grid boxed(3, 3, 20.f);
+		boxed.set(Cell{ 1, 0 }, Tile::Wall);
+		boxed.set(Cell{ 0, 1 }, Tile::Wall);
+		PathSearch ps;
+		ps.start(boxed, Cell{ 0, 0 }, Cell{ 1, 1 }, options(Algorithm::Dijkstra, true, false));
+		CHECK(ps.runToEnd(boxed) == SearchStatus::NoPath);
+		CHECK(ps.expanded() == 1);
+		CHECK(ps.frontierSize() == 0);
+
+		ps.start(boxed, Cell{ 0, 0 }, Cell{ 1, 1 }, options(Algorithm::Dijkstra, true, true));
+		CHECK(ps.runToEnd(boxed) == SearchStatus::Found);
+		CHECK(ps.path().size() == 2 && near(ps.pathCost(), 1.414214f, 1e-3f));
+
+		// one wall: forbidden diagonal forces the 2-step way round
+		Grid one(3, 3, 20.f);
+		one.set(Cell{ 1, 0 }, Tile::Wall);
+		ps.start(one, Cell{ 0, 0 }, Cell{ 1, 1 }, options(Algorithm::Dijkstra, true, false));
+		CHECK(ps.runToEnd(one) == SearchStatus::Found);
+		CHECK(near(ps.pathCost(), 2.f, 1e-3f) && ps.path().size() == 3);
+
+		ps.start(one, Cell{ 0, 0 }, Cell{ 1, 1 }, options(Algorithm::Dijkstra, true, true));
+		CHECK(ps.runToEnd(one) == SearchStatus::Found);
+		CHECK(near(ps.pathCost(), 1.414214f, 1e-3f) && ps.path().size() == 2);
+	}
+
+	// ---- BFS keeps its Checkpoint 2 behaviour with default options, and works 8-way ----
+	{
+		Grid g(40, 30, 20.f);
+		PathSearch ps;
+		ps.start(g, Cell{ 0, 0 }, Cell{ 39, 29 });                        // default options
+		CHECK(ps.runToEnd(g) == SearchStatus::Found);
+		CHECK(ps.path().size() == 69 && ps.expanded() == 1200);
+		CHECK(near(ps.pathCost(), 68.f, 1e-3f));
+
+		ps.start(g, Cell{ 0, 0 }, Cell{ 39, 29 }, options(Algorithm::BFS, true));
+		CHECK(ps.runToEnd(g) == SearchStatus::Found);
+		CHECK(ps.path().size() == 40);                                    // fewest steps = 39 moves
+	}
+
+	// ---- unreachable under Dijkstra, and start on mud is fine ----
+	{
+		Grid g(5, 5, 20.f);
+		g.set(Cell{ 3, 4 }, Tile::Wall);
+		g.set(Cell{ 4, 3 }, Tile::Wall);
+		g.set(Cell{ 0, 0 }, Tile::Mud);
+		PathSearch ps;
+		CHECK(ps.start(g, Cell{ 0, 0 }, Cell{ 4, 4 }, options(Algorithm::Dijkstra, false)));  // mud start is walkable
+		CHECK(ps.runToEnd(g) == SearchStatus::NoPath);
+		CHECK(ps.expanded() == 22);                                       // 25 - 2 walls - sealed goal
+		CHECK(ps.path().empty());
+		CHECK(!ps.start(g, Cell{ 3, 4 }, Cell{ 0, 1 }, options(Algorithm::Dijkstra, false)));  // wall start rejected
+	}
+
+	// ---- property test: random maps, Dijkstra never loses to BFS, all invariants hold ----
+	{
+		std::uint32_t seed = 12345u;
+		int compared = 0;
+		for (int map = 0; map < 40; ++map)
+		{
+			Grid g(12, 12, 20.f);
+			g.costs.mud = 3.f;
+			for (int y = 0; y < 12; ++y)
+			{
+				for (int x = 0; x < 12; ++x)
+				{
+					const std::uint32_t r = nextRand(seed) % 100;
+					if (r < 22)      g.set(Cell{ x, y }, Tile::Wall);
+					else if (r < 40) g.set(Cell{ x, y }, Tile::Mud);
+				}
+			}
+
+			Cell a{ static_cast<int>(nextRand(seed) % 12), static_cast<int>(nextRand(seed) % 12) };
+			Cell b{ static_cast<int>(nextRand(seed) % 12), static_cast<int>(nextRand(seed) % 12) };
+			if (!g.isWalkable(a) || !g.isWalkable(b)) continue;
+
+			for (int variant = 0; variant < 4; ++variant)
+			{
+				const bool diag = (variant & 1) != 0;
+				const bool cut = (variant & 2) != 0;
+				if (!diag && cut) continue;                                  // cut only matters with diagonals
+
+				PathSearch dj, bf;
+				dj.start(g, a, b, options(Algorithm::Dijkstra, diag, cut));
+				bf.start(g, a, b, options(Algorithm::BFS, diag, cut));
+
+				// Dijkstra: record the cost of each newly Visited cell, in expansion order
+				std::vector<float> popCosts;
+				std::vector<char> seen(144, 0);
+				while (dj.status() == SearchStatus::Running)
+				{
+					dj.step(g);
+					for (int y = 0; y < 12; ++y)
+						for (int x = 0; x < 12; ++x)
+						{
+							const std::size_t i = static_cast<std::size_t>(y * 12 + x);
+							if (!seen[i] && dj.stateAt(Cell{ x, y }) == NodeState::Visited)
+							{
+								seen[i] = 1;
+								popCosts.push_back(dj.costAt(Cell{ x, y }));
+							}
+						}
+				}
+				bf.runToEnd(g);
+
+				// both algorithms must agree on reachability
+				CHECK((dj.status() == SearchStatus::Found) == (bf.status() == SearchStatus::Found));
+				CHECK(dj.expanded() <= countWalkable(g));                     // no cell is expanded twice
+				CHECK(std::is_sorted(popCosts.begin(), popCosts.end()));      // cheapest-first order
+
+				if (dj.status() == SearchStatus::Found)
+				{
+					++compared;
+					CHECK(pathIsValid8(g, dj.path(), a, b, diag, cut));
+					CHECK(pathIsValid8(g, bf.path(), a, b, diag, cut));
+					CHECK(near(dj.pathCost(), recomputeCost(g, dj.path()), 1e-3f));
+					CHECK(near(bf.pathCost(), recomputeCost(g, bf.path()), 1e-3f));
+					CHECK(near(dj.costAt(b), dj.pathCost(), 1e-4f));
+					CHECK(dj.pathCost() <= bf.pathCost() + 1e-3f);            // Dijkstra is optimal
+					CHECK(bf.path().size() <= dj.path().size());              // BFS has the fewest steps
+				}
+			}
+		}
+		std::printf("Property test: %d Found comparisons\n", compared);
+		CHECK(compared > 20);                                                 // the test really exercised something
 	}
 
 	if (g_failures == 0) std::printf("All tests passed.\n");

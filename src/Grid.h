@@ -16,8 +16,17 @@
 
 enum class Tile : std::uint8_t
 {
-	Open,
-	Wall
+	Open,   // walkable, costs TerrainCosts::open to enter
+	Wall,   // NOT walkable, ever
+	Mud     // walkable, costs TerrainCosts::mud to enter
+};
+
+// Cost of ENTERING a tile of each kind (a multiplier on distance: 1 = normal).
+// Public data on purpose: ImGui edits it, and the search reads it through Grid::moveCost().
+struct TerrainCosts
+{
+	float open = 1.0f;
+	float mud = 3.0f;
 };
 
 struct Cell
@@ -41,6 +50,8 @@ class Grid
 public:
 	Grid(int cols, int rows, float cellSize);
 
+	TerrainCosts costs;   // edit freely; moveCost() clamps to a safe minimum
+
 	int   cols() const;
 	int   rows() const;
 	float cellSize() const;
@@ -53,7 +64,16 @@ public:
 
 	// Out-of-bounds writes are ignored (so a mouse outside the window can never crash).
 	void set(Cell c, Tile t);
-	void clearWalls();
+	void clearWalls();   // resets EVERY tile to Open (walls and mud); name kept for compatibility
+
+	// Walkable = inside the map and not a Wall. Mud IS walkable.
+	bool isWalkable(Cell c) const;
+
+	// Cost of entering cell c (see TerrainCosts). +infinity if c is out of bounds or a Wall.
+	// Always >= MinMoveCost for walkable cells: Dijkstra needs strictly positive costs,
+	// so a slider dragged to 0 (or below) can never break the search.
+	float moveCost(Cell c) const;
+	static constexpr float MinMoveCost = 0.01f;
 
 	Cell worldToCell(const Vec2& p) const; // uses floor, NOT truncation (so -5px -> cell -1)
 	Vec2 cellTopLeft(Cell c) const;        // pixels

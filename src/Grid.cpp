@@ -1,8 +1,8 @@
 #include "Grid.h"
-#include "Vec2.h"
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 Grid::Grid(int cols, int rows, float cellSize)
 	: m_cols(std::max(cols, 1))
@@ -40,6 +40,20 @@ void Grid::set(Cell c, Tile t)
 void Grid::clearWalls()
 {
 	std::fill(m_tiles.begin(), m_tiles.end(), Tile::Open);
+}
+
+bool Grid::isWalkable(Cell c) const
+{
+	return inBounds(c) && m_tiles[static_cast<std::size_t>(index(c))] != Tile::Wall;
+}
+
+float Grid::moveCost(Cell c) const
+{
+	if (!isWalkable(c)) return std::numeric_limits<float>::infinity();
+
+	const Tile t = m_tiles[static_cast<std::size_t>(index(c))];
+	const float raw = (t == Tile::Mud) ? costs.mud : costs.open;
+	return std::max(raw, MinMoveCost);
 }
 
 Cell Grid::worldToCell(const Vec2& p) const
