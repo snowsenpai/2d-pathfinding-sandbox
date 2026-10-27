@@ -48,6 +48,7 @@ add_executable(pathfinding_sandbox
     src/FixedStep.h
     src/Grid.h
     src/Grid.cpp
+    src/Heuristic.h
     src/PathSearch.h
     src/PathSearch.cpp
     src/Components.h

@@ -1,6 +1,7 @@
 #include "Components.h"
 #include "Game.h"
 #include "Grid.h"
+#include "Heuristic.h"
 #include "Movement.h"
 #include "PathFollow.h"
 #include "PathSearch.h"
@@ -23,9 +24,11 @@
 #include <SFML/Window/WindowEnums.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <ratio>
 #include <utility>
 #include <vector>
 
@@ -453,16 +456,55 @@ void Game::sImGui()
 		ImGui::SameLine();
 		if (ImGui::Button("Reset")) m_searchCommand = SearchCommand::Reset;
 
+		ImGui::SameLine();
+		ImGui::BeginDisabled(!ready);
+		if (ImGui::Button("Compare all")) m_searchCommand = SearchCommand::Compare;
+		ImGui::EndDisabled();
+
 		if (!ready) ImGui::TextUnformatted("Place a start and a goal first.");
 
 		// Search options. Changing any of them invalidates the current result.
 		int algo = static_cast<int>(m_searchOptions.algorithm);
-		const char* algoLabels[] = { "BFS (fewest steps)", "Dijkstra (cheapest cost)" };
+		const char* algoLabels[] = { "BFS (fewest steps)", "Dijkstra (cheapest cost)", "A* (cost + heuristic)" };
 		if (ImGui::Combo("Algorithm", &algo, algoLabels, IM_ARRAYSIZE(algoLabels)))
 		{
 			m_searchOptions.algorithm = static_cast<Algorithm>(algo);
 			m_searchOptionsChanged = true;
 		}
+		// A*-only controls. Dijkstra is A* with h = 0, so these are greyed out for it.
+		const bool isAStar = m_searchOptions.algorithm == Algorithm::AStar;
+		ImGui::BeginDisabled(!isAStar);
+		int hIdx = static_cast<int>(m_searchOptions.heuristic);
+		const char* hLabels[] = { "Zero (= Dijkstra)", "Manhattan", "Euclidean", "Chebyshev", "Octile" };
+		if (ImGui::Combo("Heuristic", &hIdx, hLabels, IM_ARRAYSIZE(hLabels)))   // order matches enum Heuristic
+		{
+			m_searchOptions.heuristic = static_cast<Heuristic>(hIdx);
+			m_searchOptionsChanged = true;
+		}
+		if (ImGui::SliderFloat("Weight", &m_searchOptions.weight, 1.0f, 10.0f, "%.2f"))
+		{
+			m_searchOptionsChanged = true;
+		}
+		if (ImGui::Checkbox("Tie-break: prefer larger g", &m_searchOptions.tieBreakLargerG))
+		{
+			m_searchOptionsChanged = true;
+		}
+		ImGui::EndDisabled();
+
+		// Tell the user when the answer is no longer guaranteed optimal.
+		if (isAStar)
+		{
+			const bool overestimates = m_searchOptions.diagonal && m_searchOptions.heuristic == Heuristic::Manhattan;
+			if (overestimates)
+			{
+				ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Manhattan overestimates with diagonals: may NOT be optimal.");
+			}
+			if (m_searchOptions.weight > 1.0f)
+			{
+				ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Weight > 1: cost may be up to %.1fx optimal.", static_cast<double>(m_searchOptions.weight));
+			}
+		}
+
 		if (ImGui::Checkbox("8-way movement", &m_searchOptions.diagonal))
 		{
 			m_searchOptionsChanged = true;
@@ -488,6 +530,31 @@ void Game::sImGui()
 			const int cells = static_cast<int>(m_search.path().size());
 			ImGui::Text("Path: %d cells (%d moves)", cells, cells - 1);
 			ImGui::Text("Path cost: %.3f", static_cast<double>(m_search.pathCost()));
+		}
+
+		// "Compare all" results. Same start, goal and options for every row; only the algorithm differs.
+		if (!m_compareRows.empty() &&
+			ImGui::BeginTable("compare", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit))
+		{
+			ImGui::TableSetupColumn("Algorithm");
+			ImGui::TableSetupColumn("Result");
+			ImGui::TableSetupColumn("Expanded");
+			ImGui::TableSetupColumn("Max frontier");
+			ImGui::TableSetupColumn("Cost");
+			ImGui::TableSetupColumn("Time (us)");
+			ImGui::TableHeadersRow();
+
+			for (const CompareRow& row : m_compareRows)
+			{
+				ImGui::TableNextRow();
+				ImGui::TableNextColumn(); ImGui::TextUnformatted(toString(row.algo));
+				ImGui::TableNextColumn(); ImGui::TextUnformatted(toString(row.status));
+				ImGui::TableNextColumn(); ImGui::Text("%d", row.expanded);
+				ImGui::TableNextColumn(); ImGui::Text("%d", row.maxFrontier);
+				ImGui::TableNextColumn(); ImGui::Text("%.3f", static_cast<double>(row.cost));
+				ImGui::TableNextColumn(); ImGui::Text("%.0f", row.microseconds);
+			}
+			ImGui::EndTable();
 		}
 	}
 
@@ -773,6 +840,7 @@ void Game::sSearch(float frameTime)
 	{
 		m_search.reset();
 		m_searchAccum = 0.f;
+		m_compareRows.clear();   // the old comparison described a map/options that no longer exist
 		// NOTE: m_mapChanged is cleared once per frame in update(), after sAgentControl AND sSearch.
 	}
 
@@ -793,6 +861,9 @@ void Game::sSearch(float frameTime)
 	case SearchCommand::Reset:
 		m_search.reset();
 		m_searchAccum = 0.f;
+		break;
+	case SearchCommand::Compare:
+		if (m_start && m_goal) runComparison();
 		break;
 	case SearchCommand::None:
 		break;
@@ -955,5 +1026,48 @@ void Game::sPathFollow(float dt)
 			f.state = FollowState::Arrived;
 			t.velocity = Vec2(0.f, 0.f);
 		}
+	}
+}
+
+// --------------------------------------------------------------------------------------
+// "Compare all": run BFS, Dijkstra and A* to completion on PRIVATE PathSearch objects, with the
+// user's current start, goal and options (only the algorithm changes per row).
+// The search shown on screen (m_search) is not touched.
+//
+// What to look at: `expanded` is the honest signal. Timing at this map size is mostly noise.
+//   * BFS      : fewest steps; its cost can be much worse than Dijkstra's on mud.
+//   * Dijkstra : cheapest path, but expands a disc around the start.
+//   * A*       : same cost as Dijkstra (admissible heuristic, weight 1) with far fewer expansions.
+// --------------------------------------------------------------------------------------
+void Game::runComparison()
+{
+	m_compareRows.clear();
+
+	const Algorithm algorithms[] = { Algorithm::BFS, Algorithm::Dijkstra, Algorithm::AStar };
+
+	for (const Algorithm algo : algorithms)
+	{
+		SearchOptions options = m_searchOptions;
+		options.algorithm = algo;
+
+		PathSearch search;
+		CompareRow row;
+		row.algo = algo;
+
+		const auto t0 = std::chrono::steady_clock::now();
+		if (search.start(m_grid, *m_start, *m_goal, options))
+		{
+			search.runToEnd(m_grid);
+		}
+		const auto t1 = std::chrono::steady_clock::now();
+
+		row.status = search.status();
+		row.expanded = search.expanded();
+		row.maxFrontier = search.maxFrontier();
+		row.cost = search.pathCost();
+		row.cells = static_cast<int>(search.path().size());
+		row.microseconds = std::chrono::duration<double, std::micro>(t1 - t0).count();
+
+		m_compareRows.push_back(row);
 	}
 }

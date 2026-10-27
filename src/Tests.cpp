@@ -1,7 +1,8 @@
-// Checkpoint 1 + 2 + 3 + path-following tests. No SFML / ImGui needed: links Vec2.cpp, Grid.cpp, PathSearch.cpp.
+// Checkpoint 1 + 2 + 3 + 4 (A*) + path-following tests. No SFML / ImGui needed: links Vec2.cpp, Grid.cpp, PathSearch.cpp.
 // Build target: sandbox_tests.  Exit code 0 = all passed.
 
 #include "FixedStep.h"
+#include "Heuristic.h"
 #include "Grid.h"
 #include "Movement.h"
 #include "PathFollow.h"
@@ -14,6 +15,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 static int g_failures = 0;
@@ -175,6 +177,69 @@ static std::uint32_t nextRand(std::uint32_t& s)
 {
 	s ^= s << 13; s ^= s >> 17; s ^= s << 5;
 	return s;
+}
+
+// ---- Checkpoint 4 helpers ----
+
+static SearchOptions astar(Heuristic h, bool diagonal, bool cornerCutting = false,
+                           float weight = 1.f, bool tieBreakLargerG = true)
+{
+	SearchOptions o;
+	o.algorithm = Algorithm::AStar;
+	o.heuristic = h;
+	o.diagonal = diagonal;
+	o.allowCornerCutting = cornerCutting;
+	o.weight = weight;
+	o.tieBreakLargerG = tieBreakLargerG;
+	return o;
+}
+
+// '.' open   '#' wall   '~' mud   'S' start   'G' goal      (rows[y][x])
+struct AsciiMap
+{
+	Grid grid;
+	Cell start;
+	Cell goal;
+};
+
+static AsciiMap parseMap(const std::vector<std::string>& rows)
+{
+	const int h = static_cast<int>(rows.size());
+	const int w = static_cast<int>(rows[0].size());
+
+	AsciiMap m{ Grid(w, h, 20.f), Cell{ -1, -1 }, Cell{ -1, -1 } };
+	for (int y = 0; y < h; ++y)
+	{
+		for (int x = 0; x < w; ++x)
+		{
+			switch (rows[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)])
+			{
+			case '#': m.grid.set(Cell{ x, y }, Tile::Wall); break;
+			case '~': m.grid.set(Cell{ x, y }, Tile::Mud);  break;
+			case 'S': m.start = Cell{ x, y };               break;
+			case 'G': m.goal = Cell{ x, y };                break;
+			default: break;
+			}
+		}
+	}
+	return m;
+}
+
+struct RunResult
+{
+	SearchStatus status;
+	float cost;
+	int cells;
+	int expanded;
+	std::vector<Cell> path;
+};
+
+static RunResult run(const Grid& g, Cell s, Cell goal, const SearchOptions& o)
+{
+	PathSearch ps;
+	ps.start(g, s, goal, o);
+	ps.runToEnd(g);
+	return RunResult{ ps.status(), ps.pathCost(), static_cast<int>(ps.path().size()), ps.expanded(), ps.path() };
 }
 
 int main()
@@ -713,6 +778,233 @@ int main()
 		}
 		std::printf("Property test: %d Found comparisons\n", compared);
 		CHECK(compared > 20);                                                 // the test really exercised something
+	}
+
+	// ================= Checkpoint 4: A* =================
+
+	// ---- heuristic values: h((0,0),(4,2)) ----
+	{
+		const Cell a{ 0, 0 }, b{ 4, 2 };
+		CHECK(heuristic(Heuristic::Zero, a, b) == 0.f);
+		CHECK(near(heuristic(Heuristic::Chebyshev, a, b), 4.f, 1e-5f));
+		CHECK(near(heuristic(Heuristic::Euclidean, a, b), 4.472136f, 1e-4f));
+		CHECK(near(heuristic(Heuristic::Octile, a, b), 4.828427f, 1e-4f));         // 2*sqrt2 + 2
+		CHECK(near(heuristic(Heuristic::Manhattan, a, b), 6.f, 1e-5f));
+
+		// symmetry, zero at the goal, and the ordering Chebyshev <= Euclidean <= Octile <= Manhattan
+		for (int dx = -5; dx <= 5; ++dx)
+		{
+			for (int dy = -5; dy <= 5; ++dy)
+			{
+				const Cell p{ 3 + dx, 3 + dy }, q{ 3, 3 };
+				const float ch = heuristic(Heuristic::Chebyshev, p, q);
+				const float eu = heuristic(Heuristic::Euclidean, p, q);
+				const float oc = heuristic(Heuristic::Octile, p, q);
+				const float ma = heuristic(Heuristic::Manhattan, p, q);
+				CHECK(ch <= eu + 1e-4f && eu <= oc + 1e-4f && oc <= ma + 1e-4f);
+				CHECK(near(oc, heuristic(Heuristic::Octile, q, p), 1e-5f));
+			}
+		}
+		CHECK(heuristic(Heuristic::Octile, Cell{ 2, 2 }, Cell{ 2, 2 }) == 0.f);
+	}
+
+	// ---- minMoveCost follows the terrain table and never reaches zero ----
+	{
+		Grid g(3, 3, 20.f);
+		CHECK(near(g.minMoveCost(), 1.f, 1e-6f));
+		g.costs.open = 2.f; g.costs.mud = 5.f;
+		CHECK(near(g.minMoveCost(), 2.f, 1e-6f));
+		g.costs.open = 0.f; g.costs.mud = -1.f;
+		CHECK(g.minMoveCost() >= Grid::MinMoveCost);
+	}
+
+	// ---- A* + Zero heuristic IS Dijkstra: same cost, same expansions, same path ----
+	{
+		std::uint32_t seed = 777u;
+		int compared = 0;
+		for (int map = 0; map < 30; ++map)
+		{
+			Grid g(12, 12, 20.f);
+			g.costs.mud = 3.f;
+			for (int y = 0; y < 12; ++y)
+				for (int x = 0; x < 12; ++x)
+				{
+					const std::uint32_t r = nextRand(seed) % 100;
+					if (r < 22)      g.set(Cell{ x, y }, Tile::Wall);
+					else if (r < 40) g.set(Cell{ x, y }, Tile::Mud);
+				}
+			const Cell a{ static_cast<int>(nextRand(seed) % 12), static_cast<int>(nextRand(seed) % 12) };
+			const Cell b{ static_cast<int>(nextRand(seed) % 12), static_cast<int>(nextRand(seed) % 12) };
+			if (!g.isWalkable(a) || !g.isWalkable(b)) continue;
+
+			const RunResult d  = run(g, a, b, options(Algorithm::Dijkstra, true));
+			const RunResult a0 = run(g, a, b, astar(Heuristic::Zero, true));
+			CHECK(d.status == a0.status);
+			CHECK(d.expanded == a0.expanded);
+			CHECK(d.path == a0.path);
+			if (d.status == SearchStatus::Found) { CHECK(near(d.cost, a0.cost, 1e-5f)); ++compared; }
+		}
+		CHECK(compared > 10);
+	}
+
+	// ---- open field, 8-way, Octile: optimal cost, a narrow search ----
+	{
+		Grid g(40, 30, 20.f);
+		const RunResult a = run(g, Cell{ 0, 0 }, Cell{ 39, 29 }, astar(Heuristic::Octile, true));
+		CHECK(a.status == SearchStatus::Found);
+		CHECK(near(a.cost, 51.012193f, 1e-3f));
+		CHECK(a.cells == 40);
+		CHECK(a.expanded > 0 && a.expanded < 400);                // reference run: ~180 (varies with tie-break/order)
+		std::printf("A* octile 8-way open field: cost=%.3f cells=%d expanded=%d (Dijkstra: 1200)\n",
+			static_cast<double>(a.cost), a.cells, a.expanded);
+	}
+
+	// ---- tie-breaking: 4-way Manhattan on an open field, every cell in the rectangle has f = 68 ----
+	{
+		Grid g(40, 30, 20.f);
+		const RunResult on  = run(g, Cell{ 0, 0 }, Cell{ 39, 29 }, astar(Heuristic::Manhattan, false, false, 1.f, true));
+		const RunResult off = run(g, Cell{ 0, 0 }, Cell{ 39, 29 }, astar(Heuristic::Manhattan, false, false, 1.f, false));
+		std::printf("A* manhattan 4-way open field: tie-break ON expanded=%d   OFF expanded=%d\n", on.expanded, off.expanded);
+		CHECK(near(on.cost, 68.f, 1e-3f) && near(off.cost, 68.f, 1e-3f));   // both optimal...
+		CHECK(on.expanded <= 300);                                           // ...but ON is ~69
+		CHECK(off.expanded == 1200);                                         // OFF degrades to Dijkstra's 1200
+	}
+
+	// ---- mud strip (7x3) ----
+	{
+		const float mudCosts[] = { 5.f, 2.f, 1.5f };
+		const float want4[]    = { 8.f, 8.f, 7.5f };
+		for (int i = 0; i < 3; ++i)
+		{
+			Grid g = mudMap(mudCosts[i]);
+			const RunResult a = run(g, Cell{ 0, 1 }, Cell{ 6, 1 }, astar(Heuristic::Manhattan, false));
+			const RunResult d = run(g, Cell{ 0, 1 }, Cell{ 6, 1 }, options(Algorithm::Dijkstra, false));
+			CHECK(a.status == SearchStatus::Found);
+			CHECK(near(a.cost, want4[i], 1e-3f));
+			CHECK(near(a.cost, d.cost, 1e-4f));
+			CHECK(a.expanded <= d.expanded);
+
+			const RunResult a8 = run(g, Cell{ 0, 1 }, Cell{ 6, 1 }, astar(Heuristic::Octile, true));
+			CHECK(near(a8.cost, 6.828427f, 1e-3f));                          // 4 + 2*sqrt2 for any mud >= 1.5
+		}
+	}
+
+	// ---- breaking A* on purpose: Manhattan overestimates when diagonals are allowed ----
+	{
+		const AsciiMap m = parseMap({
+			"S....#.#",
+			"........",
+			"##....#.",
+			"....#...",
+			".#..##.#",
+			".#......",
+			"....#...",
+			"...###.G" });
+		CHECK((m.start == Cell{ 0, 0 }));      // extra parentheses: the macro would split the braces at the comma
+		CHECK((m.goal == Cell{ 7, 7 }));
+
+		const RunResult dij  = run(m.grid, m.start, m.goal, options(Algorithm::Dijkstra, true));
+		const RunResult oct  = run(m.grid, m.start, m.goal, astar(Heuristic::Octile, true));
+		const RunResult euc  = run(m.grid, m.start, m.goal, astar(Heuristic::Euclidean, true));
+		const RunResult man  = run(m.grid, m.start, m.goal, astar(Heuristic::Manhattan, true));
+		std::printf("8x8 map  Dijkstra %.3f (%d)  Octile %.3f (%d)  Euclid %.3f (%d)  Manhattan %.3f (%d)\n",
+			static_cast<double>(dij.cost), dij.expanded, static_cast<double>(oct.cost), oct.expanded,
+			static_cast<double>(euc.cost), euc.expanded, static_cast<double>(man.cost), man.expanded);
+
+		CHECK(near(dij.cost, 11.656854f, 1e-3f));
+		CHECK(near(oct.cost, 11.656854f, 1e-3f));
+		CHECK(near(euc.cost, 11.656854f, 1e-3f));
+		CHECK(near(man.cost, 12.242641f, 1e-3f));                 // WRONG: costlier than the optimum...
+		CHECK(man.expanded < dij.expanded);                       // ...found faster. Inadmissible = fast but wrong.
+		CHECK(oct.expanded < dij.expanded);
+
+		// the same Manhattan heuristic is perfectly fine when movement is 4-way
+		const RunResult dij4 = run(m.grid, m.start, m.goal, options(Algorithm::Dijkstra, false));
+		const RunResult man4 = run(m.grid, m.start, m.goal, astar(Heuristic::Manhattan, false));
+		CHECK(near(dij4.cost, man4.cost, 1e-4f));
+	}
+
+	// ---- weighted A*: faster, never worse than weight x optimal ----
+	{
+		Grid g(40, 30, 20.f);
+		const RunResult w1 = run(g, Cell{ 0, 0 }, Cell{ 39, 29 }, astar(Heuristic::Octile, true, false, 1.f));
+		const RunResult w2 = run(g, Cell{ 0, 0 }, Cell{ 39, 29 }, astar(Heuristic::Octile, true, false, 2.f));
+		const RunResult w5 = run(g, Cell{ 0, 0 }, Cell{ 39, 29 }, astar(Heuristic::Octile, true, false, 5.f));
+		std::printf("weighted open field: w=1 expanded=%d  w=2 expanded=%d  w=5 expanded=%d\n", w1.expanded, w2.expanded, w5.expanded);
+		CHECK(w2.expanded <= w1.expanded && w5.expanded <= w2.expanded);
+		CHECK(w2.cost <= 2.f * w1.cost + 1e-3f);
+		CHECK(w5.cost <= 5.f * w1.cost + 1e-3f);
+
+		const AsciiMap m = parseMap({
+			"S....#.#", "........", "##....#.", "....#...",
+			".#..##.#", ".#......", "....#...", "...###.G" });
+		const float opt = run(m.grid, m.start, m.goal, options(Algorithm::Dijkstra, true)).cost;
+		for (float w : { 1.f, 1.5f, 2.f, 3.f, 10.f })
+		{
+			const RunResult r = run(m.grid, m.start, m.goal, astar(Heuristic::Octile, true, false, w));
+			CHECK(r.status == SearchStatus::Found);
+			CHECK(r.cost >= opt - 1e-3f);                        // never BETTER than optimal
+			CHECK(r.cost <= w * opt + 1e-3f);                    // and bounded by weight x optimal
+		}
+	}
+
+	// ---- property test: admissible heuristics always match Dijkstra's cost ----
+	{
+		std::uint32_t seed = 2468u;
+		int compared = 0;
+		long long totalDijkstra = 0, totalOctile = 0, totalManhattan4 = 0, totalDijkstra4 = 0;
+		for (int map = 0; map < 60; ++map)
+		{
+			Grid g(12, 12, 20.f);
+			g.costs.mud = 3.f;
+			for (int y = 0; y < 12; ++y)
+				for (int x = 0; x < 12; ++x)
+				{
+					const std::uint32_t r = nextRand(seed) % 100;
+					if (r < 22)      g.set(Cell{ x, y }, Tile::Wall);
+					else if (r < 40) g.set(Cell{ x, y }, Tile::Mud);
+				}
+			const Cell a{ static_cast<int>(nextRand(seed) % 12), static_cast<int>(nextRand(seed) % 12) };
+			const Cell b{ static_cast<int>(nextRand(seed) % 12), static_cast<int>(nextRand(seed) % 12) };
+			if (!g.isWalkable(a) || !g.isWalkable(b)) continue;
+
+			for (int cut = 0; cut < 2; ++cut)
+			{
+				const RunResult d = run(g, a, b, options(Algorithm::Dijkstra, true, cut != 0));
+				for (Heuristic h : { Heuristic::Octile, Heuristic::Euclidean, Heuristic::Chebyshev, Heuristic::Zero })
+				{
+					const RunResult r = run(g, a, b, astar(h, true, cut != 0));
+					CHECK(r.status == d.status);
+					if (d.status == SearchStatus::Found)
+					{
+						CHECK(near(r.cost, d.cost, 1e-3f));
+						CHECK(pathIsValid8(g, r.path, a, b, true, cut != 0));
+					}
+					if (h == Heuristic::Octile && d.status == SearchStatus::Found)
+					{
+						++compared;
+						totalDijkstra += d.expanded;
+						totalOctile += r.expanded;
+					}
+				}
+			}
+
+			// 4-way: Manhattan is exact and admissible
+			const RunResult d4 = run(g, a, b, options(Algorithm::Dijkstra, false));
+			const RunResult m4 = run(g, a, b, astar(Heuristic::Manhattan, false));
+			CHECK(d4.status == m4.status);
+			if (d4.status == SearchStatus::Found)
+			{
+				CHECK(near(d4.cost, m4.cost, 1e-3f));
+				totalDijkstra4 += d4.expanded;
+				totalManhattan4 += m4.expanded;
+			}
+		}
+		std::printf("Property test: %d Found comparisons. Expansions  8-way: Dijkstra %lld vs A* octile %lld   4-way: Dijkstra %lld vs A* manhattan %lld\n",
+			compared, totalDijkstra, totalOctile, totalDijkstra4, totalManhattan4);
+		CHECK(compared > 30);
+		CHECK(totalOctile < totalDijkstra);
+		CHECK(totalManhattan4 < totalDijkstra4);
 	}
 
 	if (g_failures == 0) std::printf("All tests passed.\n");

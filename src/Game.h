@@ -23,10 +23,22 @@
 enum class Tool { Wall, Erase, Start, Goal, Mud };
 
 // What the UI asks the search system to do next frame. The UI only REQUESTS; sSearch executes.
-enum class SearchCommand { None, Start, Step, Reset };
+enum class SearchCommand { None, Start, Step, Reset, Compare };
 
 // Same pattern for the agent: the UI requests, sAgentControl executes.
 enum class AgentCommand { None, Run, Remove };
+
+// One line of the "Compare all" table: the same start/goal/options run with each algorithm.
+struct CompareRow
+{
+	Algorithm algo = Algorithm::BFS;
+	SearchStatus status = SearchStatus::Idle;
+	int expanded = 0;
+	int maxFrontier = 0;
+	float cost = 0.f;
+	int cells = 0;
+	double microseconds = 0.0;   // wall-clock time; at this map size it is mostly noise, expansions are the real signal
+};
 
 class Game
 {
@@ -61,6 +73,7 @@ class Game
 	bool  m_showSearchOverlay = true;
 	bool  m_showHeatmap = false;                           // colour visited cells by their cost
 	SearchOptions m_searchOptions;                         // algorithm, 4/8-way, corner rule (edited in ImGui)
+	std::vector<CompareRow> m_compareRows;                 // filled by runComparison(), cleared when the map or options change
 	bool  m_searchOptionsChanged = false;                  // options changed: reset the search, but the map itself is fine
 
 	// ---------- agent (path-following simulation) ----------
@@ -96,6 +109,7 @@ class Game
 	void createWindow();               // (re)creates m_window for the current mode
 	void updateView();                 // rebuilds m_worldView for the current window size
 	void applyDisplayMode();           // full recreate cycle incl. ImGui
+	void runComparison();              // BFS vs Dijkstra vs A* on private PathSearch copies
 	void runAgent();                   // spawn an agent on the start cell and send it down the found path
 	void removeAgent();
 	void syncPathLine();               // keeps m_pathLine matching m_search (build on Found, clear otherwise)

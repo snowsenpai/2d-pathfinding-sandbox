@@ -32,6 +32,9 @@ void PathSearch::reset()
 	m_queue.clear();
 	m_heap.clear();
 	m_seq = 0;
+	m_heuristic = Heuristic::Zero;
+	m_hScale = 1.f;
+	m_weight = 1.f;
 	m_path.clear();
 	m_pathCost = 0.f;
 	m_expanded = 0;
@@ -48,6 +51,12 @@ bool PathSearch::start(const Grid& grid, Cell start, Cell goal, SearchOptions op
 	if (!grid.isWalkable(start) || !grid.isWalkable(goal)) return false;
 
 	m_options = options;
+
+	// Only A* uses a heuristic. Dijkstra is exactly A* with h = 0.
+	m_heuristic = (options.algorithm == Algorithm::AStar) ? options.heuristic : Heuristic::Zero;
+	m_weight = std::max(options.weight, 0.f);
+	m_hScale = grid.minMoveCost();   // MAP QUERY
+
 	m_start = start;
 	m_goal = goal;
 	m_cols = grid.cols();   // MAP QUERY
@@ -84,7 +93,7 @@ void PathSearch::step(const Grid& grid)
 	}
 
 	if (m_options.algorithm == Algorithm::BFS) stepBfs(grid);
-	else                                       stepDijkstra(grid);
+	else                                       stepBestFirst(grid);
 }
 
 SearchStatus PathSearch::runToEnd(const Grid& grid)
@@ -123,10 +132,20 @@ float PathSearch::stepCost(const Grid& grid, Cell to, const Cell& dir) const
 	return grid.moveCost(to) * (isDiagonal(dir) ? Sqrt2 : 1.f);       // MAP QUERY
 }
 
-void PathSearch::pushHeap(float cost, int idx)
+// Heuristic estimate of the remaining cost from `c` to the goal, in real cost units.
+//   h(c, goal)      : distance in CELLS (never pixels)
+//   * m_hScale      : times the cheapest possible step cost, so h cannot overestimate
+//   * m_weight      : 1 keeps A* optimal; >1 trades optimality for speed
+float PathSearch::estimate(Cell c) const
 {
-	m_heap.push_back(HeapEntry{ cost, m_seq++, idx });
-	std::push_heap(m_heap.begin(), m_heap.end(), HeapOrder{});
+	return m_weight * m_hScale * heuristic(m_heuristic, c, m_goal);
+}
+
+void PathSearch::pushHeap(float g, int idx)
+{
+	const float f = g + estimate(toCell(idx));   // for Dijkstra estimate() == 0, so f == g
+	m_heap.push_back(HeapEntry{ f, g, m_seq++, idx });
+	std::push_heap(m_heap.begin(), m_heap.end(), heapOrder());
 }
 
 // --------------------------------------------------------------------------------------
@@ -180,11 +199,14 @@ void PathSearch::stepBfs(const Grid& grid)
 }
 
 // --------------------------------------------------------------------------------------
-// Dijkstra: minimises TOTAL COST. Always expands the cheapest known unexpanded cell.
+// Best-first search: Dijkstra (h = 0) and A* (h = heuristic).
+// Always expands the unexpanded cell with the smallest f = g + estimate.
 // A cell may be improved (relaxed) several times while it is Frontier; once it is popped
-// (Visited) its cost is final, provided every step cost is positive.
+// (Visited) its cost g is final, provided every step cost is positive AND the heuristic is
+// consistent. With a weighted or inadmissible heuristic that guarantee is gone (and we do not
+// reopen Visited cells), which is exactly what the experiments demonstrate.
 // --------------------------------------------------------------------------------------
-void PathSearch::stepDijkstra(const Grid& grid)
+void PathSearch::stepBestFirst(const Grid& grid)
 {
 	// 1. POP the cheapest entry, silently discarding STALE ones (a better route to that cell was
 	//    found after this entry was pushed, or the cell was already expanded). Only a real
@@ -192,13 +214,13 @@ void PathSearch::stepDijkstra(const Grid& grid)
 	int curIdx = -1;
 	while (!m_heap.empty())
 	{
-		std::pop_heap(m_heap.begin(), m_heap.end(), HeapOrder{});
+		std::pop_heap(m_heap.begin(), m_heap.end(), heapOrder());
 		const HeapEntry e = m_heap.back();
 		m_heap.pop_back();
 
 		const std::size_t eIdx = static_cast<std::size_t>(e.idx);
 		if (m_state[eIdx] == NodeState::Visited) continue;     // already expanded
-		if (e.cost > m_cost[eIdx]) continue;                   // stale: a cheaper entry exists
+		if (e.g > m_cost[eIdx]) continue;                      // stale: compare g (NOT f)
 
 		curIdx = e.idx;
 		break;
@@ -217,7 +239,8 @@ void PathSearch::stepDijkstra(const Grid& grid)
 
 	const Cell cur = toCell(curIdx);
 
-	// 2. GOAL TEST at pop (NOT at push): only now is the goal's cost guaranteed to be the cheapest.
+	// 2. GOAL TEST at pop (NOT at push): only now is the goal's cost guaranteed to be the cheapest
+	//    (given an admissible heuristic).
 	if (cur == m_goal)
 	{
 		buildPath(grid);

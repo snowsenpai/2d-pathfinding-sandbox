@@ -1,5 +1,4 @@
 #include "Grid.h"
-#include "Vec2.h"
 
 #include <algorithm>
 #include <cmath>
@@ -55,6 +54,11 @@ float Grid::moveCost(Cell c) const
 	const Tile t = m_tiles[static_cast<std::size_t>(index(c))];
 	const float raw = (t == Tile::Mud) ? costs.mud : costs.open;
 	return std::max(raw, MinMoveCost);
+}
+
+float Grid::minMoveCost() const
+{
+	return std::max(std::min(costs.open, costs.mud), MinMoveCost);
 }
 
 Cell Grid::worldToCell(const Vec2& p) const

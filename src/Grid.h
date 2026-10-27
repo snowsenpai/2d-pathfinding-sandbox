@@ -75,6 +75,11 @@ public:
 	float moveCost(Cell c) const;
 	static constexpr float MinMoveCost = 0.01f;
 
+	// The cheapest cost of entering ANY walkable cell right now (>= MinMoveCost).
+	// A* multiplies its heuristic by this so the estimate can never overestimate, even if
+	// a terrain were cheaper than an open cell.
+	float minMoveCost() const;
+
 	Cell worldToCell(const Vec2& p) const; // uses floor, NOT truncation (so -5px -> cell -1)
 	Vec2 cellTopLeft(Cell c) const;        // pixels
 	Vec2 cellCenter(Cell c) const;         // pixels
