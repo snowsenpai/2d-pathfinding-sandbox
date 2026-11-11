@@ -17,9 +17,6 @@ FetchContent_Declare(SFML
 FetchContent_MakeAvailable(SFML)
 
 # ---- Dear ImGui + ImGui-SFML ----
-# Tags below (imgui v1.91.9b + imgui-sfml v3.0) are what a public SFML 3 project uses; I have NOT
-# verified them against SFML 3.1.0 myself. If configure/compile fails, check the ImGui-SFML README
-# for the imgui version it expects.
 FetchContent_Declare(imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
     GIT_TAG v1.91.9b
@@ -62,7 +59,7 @@ add_executable(pathfinding_sandbox
 target_compile_features(pathfinding_sandbox PRIVATE cxx_std_17)
 target_link_libraries(pathfinding_sandbox PRIVATE SFML::Graphics ImGui-SFML::ImGui-SFML)
 
-# ---- unit tests: no SFML, no ImGui, builds in seconds ----
+# ---- unit tests ----
 add_executable(sandbox_tests
     src/Tests.cpp
     src/Vec2.cpp
